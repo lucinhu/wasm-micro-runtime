@@ -671,7 +671,12 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         tables[table_index++] = table;
 
 #if WASM_ENABLE_GC == 0
-        /* Set all elements to -1 to mark them as uninitialized elements */
+        /* Set all elements to -1 to mark them as uninitialized elements.
+         * NOTE: `table` points to the WASMTableInstance header, so this
+         * memset also touches the header (not only elems[]); the header
+         * fields are assigned right after. On 64-bit each element becomes
+         * 0xFF..FF, not equal to NULL_REF, use is_table_elem_null() to test.
+         * TODO: memset only table->elems; (uint32)total_size may truncate */
         memset(table, -1, (uint32)total_size);
 #else
         /* For GC, all elements have already been set to NULL_REF (0) as
@@ -732,7 +737,12 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         tables[table_index++] = table;
 
 #if WASM_ENABLE_GC == 0
-        /* Set all elements to -1 to mark them as uninitialized elements */
+        /* Set all elements to -1 to mark them as uninitialized elements.
+         * NOTE: `table` points to the WASMTableInstance header, so this
+         * memset also touches the header (not only elems[]); the header
+         * fields are assigned right after. On 64-bit each element becomes
+         * 0xFF..FF, not equal to NULL_REF, use is_table_elem_null() to test.
+         * TODO: memset only table->elems; (uint32)total_size may truncate */
         memset(table, -1, (uint32)total_size);
 #else
         /* For GC, all elements have already been set to NULL_REF (0) as
@@ -3082,7 +3092,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
         for (j = 0; j < length; j++) {
             InitializerExpression *init_expr = &table_seg->init_values[j];
             uint8 flag = init_expr->init_expr_type;
-            void *ref = NULL;
+            table_elem_type_t ref = NULL_REF;
 
             /* const and get global init values should be resolved during
              * loading */
@@ -3093,12 +3103,12 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 
             switch (flag) {
                 case INIT_EXPR_TYPE_REFNULL_CONST:
-                    ref = NULL;
+                    ref = NULL_REF;
                     break;
                 case INIT_EXPR_TYPE_FUNCREF_CONST:
                 {
 #if WASM_ENABLE_GC == 0
-                    ref = (void *)(uintptr_t)init_expr->u.unary.v.ref_index;
+                    ref = (uintptr_t)init_expr->u.unary.v.ref_index;
 #else
                     WASMFuncObjectRef func_obj;
                     uint32 func_idx = init_expr->u.unary.v.ref_index;
@@ -3256,7 +3266,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 #endif /* end of WASM_ENABLE_GC != 0 */
             }
 
-            *(table_data + offset_value.i32 + j) = (table_elem_type_t)ref;
+            *(table_data + offset_value.i32 + j) = ref;
         }
     }
 
@@ -3837,10 +3847,26 @@ wasm_module_malloc_internal(WASMModuleInstance *module_inst,
                 module_inst->e->retain_function, size, &offset)) {
             return 0;
         }
+
+        if (!offset) {
+            LOG_WARNING("warning: allocate %" PRIu64 " bytes memory failed",
+                        size);
+            wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
+            return 0;
+        }
+
         /* If we use app's malloc function,
            the default memory may be changed while memory growing */
         memory = wasm_get_default_memory(module_inst);
-        addr = offset ? memory->memory_data + offset : NULL;
+        if (offset > memory->memory_data_size
+            || size > memory->memory_data_size - offset) {
+            LOG_ERROR("error: malloc returned offset %" PRIu64
+                      " out of linear memory of size %" PRIu64,
+                      offset, memory->memory_data_size);
+            wasm_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
+            return 0;
+        }
+        addr = memory->memory_data + offset;
     }
 
     if (!addr) {
@@ -3879,10 +3905,23 @@ wasm_module_realloc_internal(WASMModuleInstance *module_inst,
     }
 
     if (memory->heap_handle) {
-        addr = mem_allocator_realloc(
-            memory->heap_handle,
-            (uint32)ptr ? memory->memory_data + (uint32)ptr : NULL,
-            (uint32)size);
+        addr = ptr ? memory->memory_data + (uint32)ptr : NULL;
+
+        /* Only realloc a block that lives in the app heap: the guest may
+           pass an arbitrary offset, and the heap may have moved on grow */
+        if (addr) {
+            uint8 *heap_data, *heap_data_end;
+
+            SHARED_MEMORY_LOCK(memory);
+            heap_data = memory->heap_data;
+            heap_data_end = memory->heap_data_end;
+            SHARED_MEMORY_UNLOCK(memory);
+
+            if (!(heap_data <= addr && addr < heap_data_end))
+                return 0;
+        }
+
+        addr = mem_allocator_realloc(memory->heap_handle, addr, (uint32)size);
     }
 
     /* Only support realloc in WAMR's app heap */
@@ -4044,7 +4083,7 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
     }
 
     tbl_elem_val = ((table_elem_type_t *)table_inst->elems)[tbl_elem_idx];
-    if (tbl_elem_val == NULL_REF) {
+    if (is_table_elem_null(tbl_elem_val)) {
         wasm_set_exception(module_inst, "uninitialized element");
         goto got_exception;
     }

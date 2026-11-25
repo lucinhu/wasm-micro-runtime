@@ -17,7 +17,7 @@ function help()
     echo "test_wamr.sh [options]"
     echo "-c clean previous test results, not start test"
     echo "-s {suite_name} test only one suite (spec|standalone|malformed|wasi_certification|"
-    echo "                                     unit|wamr_compiler)"
+    echo "                                     unit|wamr_compiler|regression)"
     echo "-m set compile target of iwasm(x86_64|x86_32|armv7|armv7_vfp|thumbv7|thumbv7_vfp|"
     echo "                               riscv32|riscv32_ilp32f|riscv32_ilp32d|riscv64|"
     echo "                               riscv64_lp64f|riscv64_lp64d|aarch64|aarch64_vfp)"
@@ -47,6 +47,7 @@ function help()
     echo "-A use the specified wamrc command instead of building it"
     echo "-N enable extended const expression feature"
     echo "-U enable full unit test (passes FULL_TEST=ON to cmake when -s unit is used)"
+    echo "   unit tests skip fast-jit and multi-tier-jit until cases are available"
     echo "-r [requirement name] [N [N ...]] specify a requirement name followed by one or more"
     echo "                                  subrequirement IDs, if no subrequirement is specificed,"
     echo "                                  it will run all subrequirements. When this optin is used,"
@@ -73,6 +74,7 @@ ENABLE_EH=0
 ENABLE_DEBUG_VERSION=0
 ENABLE_GC_HEAP_VERIFY=0
 UNIT_FULL_TEST=0
+UNIT_TEST_BUILD_DIRS=()
 #unit test case arrary
 TEST_CASE_ARR=()
 SGX_OPT=""
@@ -272,6 +274,39 @@ mkdir -p ${REPORT_DIR}
 readonly WAMR_DIR=${WORK_DIR}/../../..
 readonly REQUIREMENT_SCRIPT_DIR=${WORK_DIR}/../requirement-engineering-test-script
 
+# Code coverage (-C): every suite gets one report, holding all the running modes
+# that were tested in this invocation.
+#
+# COVERAGE_DIR lets a driver (coverage/run_coverage.py) decide where the reports
+# and the preserved standalone gcov data are written; without it they stay under
+# this run's REPORT_DIR.
+# TODO: the environment variable is a workaround -- test_wamr.sh should take the
+#       coverage output directory as a regular option instead.
+readonly COVERAGE_ROOT=${COVERAGE_DIR:-${REPORT_DIR}}
+mkdir -p "${COVERAGE_ROOT}"
+readonly GCOVR_SCRIPT=${WORK_DIR}/../coverage/collect_coverage_gcovr.py
+
+# The standalone cases that build their own iwasm tree, i.e. the only build dirs
+# whose gcov data belongs to the standalone suite.  collect_standalone() copies
+# their data once per running mode, because each case's run.sh rebuilds into
+# <case>/build for every mode (rm -fr build): without the copy every mode but
+# the last one would be gone when the suite report is written.  This is the only
+# place in this script that copies gcov data; the iwasm and unit builds keep one
+# build dir per running mode instead and need no copy.
+readonly -a STANDALONE_COVERAGE_CASES=(
+    "dump-call-stack"
+    "dump-mem-profiling"
+    "dump-perf-profiling"
+    "test-invoke-native"
+    "test-running-modes"
+    "test-running-modes/c-embed"
+    "test-module-malloc"
+)
+
+# Build dirs of the iwasm (spec) coverage, one per running mode; filled in by
+# build_iwasm_with_cfg().
+COVERAGE_SPEC_DIRS=()
+
 if [[ ${SGX_OPT} == "--sgx" ]];then
     readonly IWASM_LINUX_ROOT_DIR="${WAMR_DIR}/product-mini/platforms/linux-sgx"
     readonly IWASM_CMD="${WAMR_DIR}/product-mini/platforms/linux-sgx/enclave-sample/iwasm"
@@ -334,27 +369,116 @@ readonly COMPILE_FLAGS=(
 
 function unit_test()
 {
-    echo "Now start unit tests"
-
     cd ${WORK_DIR}
-    rm -fr unittest-build
-
-    echo "Build unit test"
     touch ${REPORT_DIR}/unit_test_report.txt
-    cmake -S ${WORK_DIR}/../../unit -B unittest-build \
-      -DCOLLECT_CODE_COVERAGE=${COLLECT_CODE_COVERAGE} \
-      -DFULL_TEST=${UNIT_FULL_TEST} \
-      -DWAMRC_COMPILER_DIR=${WAMR_DIR}/wamr-compiler/build
-    cmake --build unittest-build
-    ctest --test-dir unittest-build --output-on-failure | tee -a ${REPORT_DIR}/unit_test_report.txt
 
-    echo "Finish unit tests"
+    for unit_mode in "${TYPE[@]}"; do
+        case ${unit_mode} in
+            fast-jit|multi-tier-jit)
+                echo "Skip unit tests in ${unit_mode}: no test cases available"
+                continue
+                ;;
+            classic-interp)
+                unit_mode_flags="${CLASSIC_INTERP_COMPILE_FLAGS}"
+                ;;
+            fast-interp)
+                unit_mode_flags="${FAST_INTERP_COMPILE_FLAGS}"
+                ;;
+            jit)
+                unit_mode_flags="-DWAMR_BUILD_TARGET=${TARGET} \
+                    -DWAMR_BUILD_INTERP=0 -DWAMR_BUILD_FAST_INTERP=0 \
+                    -DWAMR_BUILD_JIT=1 -DWAMR_BUILD_AOT=0 \
+                    -DWAMR_BUILD_FAST_JIT=0"
+                ;;
+            aot)
+                unit_mode_flags="${AOT_COMPILE_FLAGS}"
+                if [[ -z "${WAMRC_CMD}" ]]; then
+                    build_wamrc
+                    WAMRC_CMD=${WAMRC_CMD_DEFAULT}
+                fi
+                ;;
+            *)
+                echo "unexpected unit test mode: ${unit_mode}"
+                return 1
+                ;;
+        esac
+
+        local unit_build_dir="${WORK_DIR}/unittest-build-${unit_mode}"
+        echo "Now start unit tests in ${unit_mode}"
+        rm -fr "${unit_build_dir}"
+        UNIT_TEST_BUILD_DIRS+=("${unit_build_dir}")
+
+        echo "Build unit test"
+        cmake -S "${WORK_DIR}/../../unit" -B "${unit_build_dir}" \
+          ${unit_mode_flags} \
+          -DCOLLECT_CODE_COVERAGE="${COLLECT_CODE_COVERAGE}" \
+          -DFULL_TEST="${UNIT_FULL_TEST}" \
+          -DWAMRC_ROOT="$(dirname "${WAMRC_CMD}")"
+        cmake --build "${unit_build_dir}"
+        ctest --test-dir "${unit_build_dir}" --output-on-failure \
+          | tee -a "${REPORT_DIR}/unit_test_report.txt"
+        local ctest_status=${PIPESTATUS[0]}
+        if [[ ${ctest_status} -ne 0 ]]; then
+            return ${ctest_status}
+        fi
+        echo "Finish unit tests in ${unit_mode}"
+    done
+}
+
+function regression_test()
+{
+    cd ${WORK_DIR}
+    touch ${REPORT_DIR}/regression_test_report.txt
+
+    # build_run.py must run from the ba-issues directory (it uses relative
+    # paths for running_config.json, issues/ and build/).
+    local regression_dir="${WAMR_DIR}/tests/regression/ba-issues"
+
+    for reg_mode in "${TYPE[@]}"; do
+        case ${reg_mode} in
+            multi-tier-jit)
+                echo "Skip regression tests in ${reg_mode}: no test cases available"
+                continue
+                ;;
+            jit)
+                # test_wamr.sh names the LLVM JIT mode 'jit', build_run.py
+                # calls it 'llvm-jit'
+                run_mode="llvm-jit"
+                ;;
+            classic-interp|fast-interp|aot|fast-jit)
+                run_mode="${reg_mode}"
+                ;;
+            *)
+                echo "unexpected regression test mode: ${reg_mode}"
+                return 1
+                ;;
+        esac
+
+        echo "Now start regression tests in ${reg_mode}"
+        local build_run_args=("--mode" "${run_mode}")
+        if [[ ${COLLECT_CODE_COVERAGE} == 1 ]]; then
+            build_run_args+=("--coverage")
+        fi
+
+        ( cd "${regression_dir}" \
+            && ${PYTHON_EXE} build_run.py "${build_run_args[@]}" ) \
+            | tee -a "${REPORT_DIR}/regression_test_report.txt"
+        local reg_status=${PIPESTATUS[0]}
+        if [[ ${reg_status} -ne 0 ]]; then
+            return ${reg_status}
+        fi
+        echo "Finish regression tests in ${reg_mode}"
+    done
 }
 
 function sightglass_test()
 {
     echo "Now start sightglass benchmark tests"
 
+    # TODO: nothing in this suite is checked -- the cd, the ./test_*.sh runs and
+    #       the cp all run unchecked, so a failing benchmark is invisible to
+    #       test_wamr.sh.  Check the cd and the run status once the suite is
+    #       exercised again (its directory is not part of this tree).
     cd ${WORK_DIR}/../sightglass/benchmarks
 
     # build iwasm first
@@ -375,6 +499,21 @@ function sightglass_test()
     fi
 
     echo "Finish sightglass benchmark tests"
+}
+
+# Fetch ${2} into ${1}. curl ships with every hosted runner image and wget no
+# longer does (windows-2022 dropped it), but container images may carry either
+# one, so fall back to wget when curl is missing.
+function download_file()
+{
+    local dest=$1
+    local url=$2
+
+    if command -v curl > /dev/null 2>&1; then
+        curl -fL -o "${dest}" "${url}"
+    else
+        wget -O "${dest}" --progress=dot:giga "${url}"
+    fi
 }
 
 function setup_wabt()
@@ -406,12 +545,12 @@ function setup_wabt()
         local WAT2WASM=${WORK_DIR}/wabt/out/gcc/Release/wat2wasm
         if [ ! -f ${WAT2WASM} ]; then
             pushd /tmp
-            wget -O wabt-tar.gz --progress=dot:giga ${WABT_URL}
-            tar xf wabt-tar.gz
+            download_file wabt-tar.gz ${WABT_URL} || exit 1
+            tar xf wabt-tar.gz || exit 1
             popd
 
             mkdir -p ${WORK_DIR}/wabt/out/gcc/Release/
-            cp /tmp/wabt-${WABT_VERSION}/bin/* ${WORK_DIR}/wabt/out/gcc/Release/
+            cp /tmp/wabt-${WABT_VERSION}/bin/* ${WORK_DIR}/wabt/out/gcc/Release/ || exit 1
         fi
     else
         echo "download source code and compile and install"
@@ -461,32 +600,32 @@ function spec_test()
         echo "checkout spec from threads proposal"
 
         # check spec test cases for threads
-        git clone -b main-legacy --single-branch https://github.com/WebAssembly/threads.git spec
-        pushd spec
+        git clone -b main-legacy --single-branch https://github.com/WebAssembly/threads.git spec || exit 1
+        pushd spec || exit 1
 
         # May 31, 2023 [interpreter] implement atomic.wait and atomic.notify (#194)
-        git reset --hard 09f2831349bf409187abb6f7868482a8079f2264
+        git reset --hard 09f2831349bf409187abb6f7868482a8079f2264 || exit 1
         git apply --ignore-whitespace ../../spec-test-script/thread_proposal_ignore_cases.patch || exit 1
         git apply --ignore-whitespace ../../spec-test-script/thread_proposal_fix_atomic_case.patch || exit 1
         git apply --ignore-whitespace ../../spec-test-script/thread_proposal_remove_memory64_flag_case.patch
     elif [ ${ENABLE_EH} == 1 ]; then
         echo "checkout exception-handling test cases"
 
-        git clone -b main --single-branch https://github.com/WebAssembly/exception-handling spec
-        pushd spec
+        git clone -b main --single-branch https://github.com/WebAssembly/exception-handling spec || exit 1
+        pushd spec || exit 1
 
         # Jun 6, 2023 Merge branch 'upstream' into merge-upstream
-        git reset --hard 51c721661b671bb7dc4b3a3acb9e079b49778d36
+        git reset --hard 51c721661b671bb7dc4b3a3acb9e079b49778d36 || exit 1
         git apply --ignore-whitespace ../../spec-test-script/exception_handling.patch || exit 1
     elif [[ ${ENABLE_GC} == 1 ]]; then
         echo "checkout spec for GC proposal"
 
         # check spec test cases for GC
-        git clone -b main --single-branch https://github.com/WebAssembly/gc.git spec
-        pushd spec
+        git clone -b main --single-branch https://github.com/WebAssembly/gc.git spec || exit 1
+        pushd spec || exit 1
 
         #  Dec 9, 2024. Merge branch 'funcref'
-        git reset --hard 756060f5816c7e2159f4817fbdee76cf52f9c923
+        git reset --hard 756060f5816c7e2159f4817fbdee76cf52f9c923 || exit 1
         git apply --ignore-whitespace ../../spec-test-script/gc_ignore_cases.patch || exit 1
         git apply --ignore-whitespace ../../spec-test-script/gc_array_fill_cases.patch || exit 1
 
@@ -507,11 +646,11 @@ function spec_test()
     elif [[ ${ENABLE_EXTENDED_CONST_EXPR} == 1 ]]; then
         echo "checkout spec for extended const expression proposal"
 
-        git clone -b main --single-branch https://github.com/WebAssembly/extended-const.git spec
-        pushd spec
+        git clone -b main --single-branch https://github.com/WebAssembly/extended-const.git spec || exit 1
+        pushd spec || exit 1
 
         # Jan 14, 2025. README.md: Add note that this proposal is done (#20)
-        git reset --hard 8d4f6aa2b00a8e7c0174410028625c6a176db8a1
+        git reset --hard 8d4f6aa2b00a8e7c0174410028625c6a176db8a1 || exit 1
         # ignore import table cases
         git apply --ignore-whitespace ../../spec-test-script/extended_const.patch || exit 1
 
@@ -519,11 +658,11 @@ function spec_test()
         echo "checkout spec for memory64 proposal"
 
         # check spec test cases for memory64
-        git clone -b main --single-branch https://github.com/WebAssembly/memory64.git spec
-        pushd spec
+        git clone -b main --single-branch https://github.com/WebAssembly/memory64.git spec || exit 1
+        pushd spec || exit 1
 
         # Reset to commit: "Merge remote-tracking branch 'upstream/main' into merge2"
-        git reset --hard 48e69f394869c55b7bbe14ac963c09f4605490b6
+        git reset --hard 48e69f394869c55b7bbe14ac963c09f4605490b6 || exit 1
         git checkout 044d0d2e77bdcbe891f7e0b9dd2ac01d56435f0b -- test/core/elem.wast test/core/data.wast
         # Patch table64 extension
         git checkout 940398cd4823522a9b36bec4984be4b153dedb81 -- test/core/call_indirect.wast test/core/table.wast test/core/table_copy.wast test/core/table_copy_mixed.wast test/core/table_fill.wast test/core/table_get.wast test/core/table_grow.wast test/core/table_init.wast test/core/table_set.wast test/core/table_size.wast
@@ -532,11 +671,11 @@ function spec_test()
         echo "checkout spec for multi memory proposal"
 
         # check spec test cases for multi memory
-        git clone -b main --single-branch https://github.com/WebAssembly/multi-memory.git spec
-        pushd spec
+        git clone -b main --single-branch https://github.com/WebAssembly/multi-memory.git spec || exit 1
+        pushd spec || exit 1
 
         # Reset to commit: "Merge pull request #48 from backes/specify-memcpy-immediate-order"
-        git reset --hard fbc99efd7a788db300aec3dd62a14577ec404f1b
+        git reset --hard fbc99efd7a788db300aec3dd62a14577ec404f1b || exit 1
         git checkout 044d0d2e77bdcbe891f7e0b9dd2ac01d56435f0b -- test/core/elem.wast
         git apply --ignore-whitespace ../../spec-test-script/multi_memory_ignore_cases.patch || exit 1
         if [[ ${RUNNING_MODE} == "aot" ]]; then
@@ -545,11 +684,11 @@ function spec_test()
     else
         echo "checkout spec for default proposal"
 
-        git clone -b main --single-branch https://github.com/WebAssembly/spec
-        pushd spec
+        git clone -b main --single-branch https://github.com/WebAssembly/spec || exit 1
+        pushd spec || exit 1
 
         # Dec 20, 2024. Use WPT version of test harness for HTML core test conversion (#1859)
-        git reset --hard f3a0e06235d2d84bb0f3b5014da4370613886965
+        git reset --hard f3a0e06235d2d84bb0f3b5014da4370613886965 || exit 1
         git apply --ignore-whitespace ../../spec-test-script/ignore_cases.patch || exit 1
         if [[ ${ENABLE_SIMD} == 1 ]]; then
             git apply --ignore-whitespace ../../spec-test-script/simd_ignore_cases.patch || exit 1
@@ -686,10 +825,10 @@ function wasi_certification_test()
     if [ ! -d "wasi-testsuite" ]; then
         echo "wasi-testsuite not exist, clone it from github"
         git clone -b prod/testsuite-all \
-            --single-branch https://github.com/WebAssembly/wasi-testsuite.git
+            --single-branch https://github.com/WebAssembly/wasi-testsuite.git || exit 1
     fi
-    cd wasi-testsuite
-    git reset --hard ${WASI_TESTSUITE_COMMIT}
+    cd wasi-testsuite || exit 1
+    git reset --hard ${WASI_TESTSUITE_COMMIT} || exit 1
 
     TSAN_OPTIONS=${TSAN_OPTIONS} bash ../../wasi-test-script/run_wasi_tests.sh $1 $TARGET $WASI_TEST_FILTER \
         | tee -a ${REPORT_DIR}/wasi_test_report.txt
@@ -706,6 +845,10 @@ function polybench_test()
 {
     echo "Now start polybench tests"
 
+    # TODO: as in the standalone and sightglass suites, the cd and the
+    #       build/test steps below are unchecked, so a failure never reaches
+    #       test_wamr.sh's exit status.  Check them once the suite is exercised
+    #       again (its directory is not part of this tree).
     cd ${WORK_DIR}/../polybench
     if [[ $1 == "aot" || $1 == "jit" ]];then
         ./build.sh AOT ${SGX_OPT}
@@ -723,6 +866,10 @@ function libsodium_test()
 {
     echo "Now start libsodium tests"
 
+    # TODO: as in the standalone and sightglass suites, the cd and the
+    #       build/test steps below are unchecked, so a failure never reaches
+    #       test_wamr.sh's exit status.  Check them once the suite is exercised
+    #       again (its directory is not part of this tree).
     cd ${WORK_DIR}/../libsodium
     if [[ $1 == "aot" || $1 == "jit" ]];then
         ./build.sh ${SGX_OPT}
@@ -740,44 +887,47 @@ function malformed_test()
     # build iwasm firstly
     cd ${WORK_DIR}/../../malformed
     ./malformed_test.py --run ${IWASM_CMD} | tee ${REPORT_DIR}/malfomed_$1_test_report.txt
+    local malformed_status=${PIPESTATUS[0]}
+    if [[ ${malformed_status} -ne 0 ]]; then
+        echo -e "\nmalformed tests FAILED"
+        exit 1
+    fi
+}
+
+function copy_gcov_data()
+{
+    # Copy the .gcno/.gcda of one build tree into <dst>, keeping the tree layout.
+    local dst="$1" src="$2"
+    [[ -d "${src}" ]] || return 0
+    (
+        cd "${src}" || exit 0
+        find . -type f \( -name '*.gcno' -o -name '*.gcda' \) -print0 \
+            | while IFS= read -r -d '' f; do
+                  mkdir -p "${dst}/${f%/*}"
+                  cp -p "${f}" "${dst}/${f}"
+              done
+    )
 }
 
 function collect_standalone()
 {
     if [[ ${COLLECT_CODE_COVERAGE} == 1 ]]; then
-        pushd ${WORK_DIR} > /dev/null 2>&1
+        local mode="$1"
+        local STANDALONE_DIR=${WORK_DIR}/../../standalone
+        local case_dir
 
-        CODE_COV_FILE=""
-        if [[ -z "${CODE_COV_FILE}" ]]; then
-            CODE_COV_FILE="${WORK_DIR}/wamr.lcov"
-        else
-            CODE_COV_FILE="${CODE_COV_FILE}"
-        fi
-
-        STANDALONE_DIR=${WORK_DIR}/../../standalone
-
-        echo "Collect code coverage of standalone dump-call-stack"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/dump-call-stack/build"
-        echo "Collect code coverage of standalone dump-mem-profiling"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/dump-mem-profiling/build"
-        echo "Collect code coverage of standalone dump-perf-profiling"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/dump-perf-profiling/build"
-        if [[ $1 == "aot" ]]; then
-            echo "Collect code coverage of standalone pad-test"
-            ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/pad-test/build"
-        fi
-        echo "Collect code coverage of standalone test-invoke-native"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/test-invoke-native/build"
-        echo "Collect code coverage of standalone test-running-modes"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/test-running-modes/build"
-        echo "Collect code coverage of standalone test-running-modes/c-embed"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/test-running-modes/c-embed/build"
-        echo "Collect code coverage of standalone test-ts2"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/test-ts2/build"
-        echo "Collect code coverage of standalone test-module-malloc"
-        ./collect_coverage.sh "${CODE_COV_FILE}" "${STANDALONE_DIR}/test-module-malloc/build"
-
-        popd > /dev/null 2>&1
+        # The standalone cases are the one place where the gcov data is copied:
+        # every case's run.sh rebuilds into <case>/build for each running mode
+        # (rm -fr build), so what this mode produced has to be saved before the
+        # next mode gets there.  <mode> keeps the running modes of this
+        # invocation apart, <case> keeps the cases apart (they would all collide
+        # on their relative ./CMakeFiles layout otherwise).
+        for case_dir in "${STANDALONE_COVERAGE_CASES[@]}"; do
+            copy_gcov_data "${COVERAGE_ROOT}/standalone/${mode}/${case_dir}" \
+                           "${STANDALONE_DIR}/${case_dir}/build"
+        done
+        echo "Saved gcov data of standalone ${mode} under" \
+             "${COVERAGE_ROOT}/standalone/${mode}"
     fi
 }
 
@@ -799,6 +949,10 @@ function standalone_test()
 
     args="$args ${TARGET}"
 
+    # TODO: a failing standalone case is invisible here -- the pipeline's status
+    #       is tee's, and standalone.sh always exits 0.  Make standalone.sh
+    #       return its failed-case count (a change under tests/standalone/) and
+    #       check it here, the way the other suites do.
     ./standalone.sh $args | tee ${REPORT_DIR}/standalone_$1_test_report.txt
 
     collect_standalone "$1"
@@ -806,24 +960,32 @@ function standalone_test()
 
 function build_iwasm_with_cfg()
 {
+    # $1: running mode label of this build; the rest: cmake flags.  The build
+    # goes to build/<mode>/, so the running modes tested in one invocation keep
+    # their own build dir (and their own gcov data) instead of overwriting each
+    # other.
+    local mode="$1"; shift
     echo "Build iwasm with compile flags " $* " for spec test" \
         | tee -a ${REPORT_DIR}/spec_test_report.txt
 
     if [[ ${SGX_OPT} == "--sgx" ]];then
         cd ${WAMR_DIR}/product-mini/platforms/linux-sgx \
-        && if [ -d build ]; then rm -rf build/*; else mkdir build; fi \
-        && cd build \
-        && cmake $* .. \
+        && rm -rf build/${mode} \
+        && mkdir -p build/${mode} \
+        && cd build/${mode} \
+        && cmake $* ../.. \
         && make -j 4
         cd ${WAMR_DIR}/product-mini/platforms/linux-sgx/enclave-sample \
         && make clean \
         && make SPEC_TEST=1
     else
         cd ${WAMR_DIR}/product-mini/platforms/${PLATFORM} \
-        && if [ -d build ]; then rm -rf build/*; else mkdir build; fi \
-        && cd build \
-        && cmake $* .. \
-        && cmake --build . -j 4 --config RelWithDebInfo --target iwasm
+        && rm -rf build/${mode} \
+        && mkdir -p build/${mode} \
+        && cd build/${mode} \
+        && cmake $* ../.. \
+        && cmake --build . -j 4 --config RelWithDebInfo --target iwasm \
+        && { ln -sfn ${mode}/iwasm ../iwasm || cp -f iwasm ../iwasm; }
     fi
 
     if [ "$?" != 0 ];then
@@ -831,14 +993,17 @@ function build_iwasm_with_cfg()
         exit 1
     fi
 
+    COVERAGE_SPEC_DIRS+=("${IWASM_LINUX_ROOT_DIR}/build/${mode}")
+
     if [[ ${PLATFORM} == "cosmopolitan" ]]; then
         # convert from APE to ELF so it can be ran easier
         # HACK: link to linux so tests work when platform is detected by uname
         cp iwasm.com iwasm \
         && ./iwasm --assimilate \
-        && rm -rf ../../linux/build \
-        && mkdir ../../linux/build \
-        && ln -s ../../cosmopolitan/build/iwasm ../../linux/build/iwasm
+        && rm -rf ../../../linux/build/${mode} \
+        && mkdir -p ../../../linux/build/${mode} \
+        && ln -s ../../../cosmopolitan/build/${mode}/iwasm ../../../linux/build/${mode}/iwasm \
+        && ln -sfn ${mode}/iwasm ../../../linux/build/iwasm
         if [ "$?" != 0 ];then
             echo -e "build iwasm failed (cosmopolitan)"
             exit 1
@@ -877,36 +1042,40 @@ function build_wamrc()
 #
 # }
 
-function collect_coverage()
+function report_coverage()
 {
-    if [[ ${COLLECT_CODE_COVERAGE} == 1 ]]; then
-        ln -sf ${WORK_DIR}/../spec-test-script/collect_coverage.sh ${WORK_DIR}
-
-        CODE_COV_FILE=""
-        if [[ -z "${CODE_COV_FILE}" ]]; then
-            CODE_COV_FILE="${WORK_DIR}/wamr.lcov"
-        else
-            CODE_COV_FILE="${CODE_COV_FILE}"
-        fi
-
-        pushd ${WORK_DIR} > /dev/null 2>&1
-        echo "Collect code coverage of iwasm"
-        ./collect_coverage.sh ${CODE_COV_FILE} ${IWASM_LINUX_ROOT_DIR}/build
-        if [[ $1 == "llvm-aot" ]]; then
-            echo "Collect code coverage of wamrc"
-            ./collect_coverage.sh ${CODE_COV_FILE} ${WAMR_DIR}/wamr-compiler/build
-        fi
-        for suite in "${TEST_CASE_ARR[@]}"; do
-            if [[ ${suite} = "unit" ]]; then
-                echo "Collect code coverage of unit test"
-                ./collect_coverage.sh ${CODE_COV_FILE} ${WORK_DIR}/unittest-build
-                break
-            fi
-        done
-        popd > /dev/null 2>&1
-    else
-        echo "code coverage isn't collected"
+    # One report per suite, holding every running mode this invocation tested
+    # (the suite's build dirs are passed in).  Nothing is collected per pass and
+    # nothing is deleted: the iwasm and unit builds keep one build dir per
+    # running mode, and the standalone data was copied out of the way per mode,
+    # so all of it is still there when this runs.
+    if [[ ${COLLECT_CODE_COVERAGE} != 1 ]]; then
+        return 0
     fi
+
+    local suite="$1"; shift
+    local BUILD_DIRS=()
+    local dir
+
+    for dir in "$@"; do
+        [[ -d "${dir}" ]] && BUILD_DIRS+=("${dir}")
+    done
+    if [[ ${#BUILD_DIRS[@]} -eq 0 ]]; then
+        echo "No build dir with gcov data for the ${suite} suite, no report written"
+        return 0
+    fi
+
+    local out_dir="${COVERAGE_ROOT}/${suite}"
+    echo "Collect code coverage of ${suite} from ${#BUILD_DIRS[@]} build dir(s)"
+    # The collector's status is this function's status: a report that was asked
+    # for (`-C`) and not produced is a failure, not a message.
+    local status=0
+    python3 "${GCOVR_SCRIPT}" --out "${out_dir}" "${BUILD_DIRS[@]}" || status=$?
+    if [[ ${status} -ne 0 ]]; then
+        echo "Coverage collection of the ${suite} suite failed (rc=${status})"
+        return ${status}
+    fi
+    echo "Coverage report of ${suite} at ${out_dir}"
 }
 
 # decide whether execute test cases in current running mode based on the current configuration or not
@@ -1125,42 +1294,38 @@ function trigger()
                 # classic-interp
                 BUILD_FLAGS="$CLASSIC_INTERP_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
                 if [[ ${ENABLE_QEMU} == 0 ]]; then
-                    build_iwasm_with_cfg $BUILD_FLAGS
+                    build_iwasm_with_cfg classic-interp $BUILD_FLAGS
                 fi
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" classic-interp
                 done
-                collect_coverage classic-interp
             ;;
 
             "fast-interp")
                 # fast-interp
                 BUILD_FLAGS="$FAST_INTERP_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
                 if [[ ${ENABLE_QEMU} == 0 ]]; then
-                    build_iwasm_with_cfg $BUILD_FLAGS
+                    build_iwasm_with_cfg fast-interp $BUILD_FLAGS
                 fi
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" fast-interp
                 done
-                collect_coverage fast-interp
             ;;
 
             "jit")
                 echo "work in orc jit eager compilation mode"
                 BUILD_FLAGS="$ORC_EAGER_JIT_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
-                build_iwasm_with_cfg $BUILD_FLAGS
+                build_iwasm_with_cfg llvm-jit-eager $BUILD_FLAGS
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" jit
                 done
-                collect_coverage llvm-jit
 
                 echo "work in orc jit lazy compilation mode"
                 BUILD_FLAGS="$ORC_LAZY_JIT_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
-                build_iwasm_with_cfg $BUILD_FLAGS
+                build_iwasm_with_cfg llvm-jit-lazy $BUILD_FLAGS
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" jit
                 done
-                collect_coverage llvm-jit
             ;;
 
             "aot")
@@ -1168,38 +1333,38 @@ function trigger()
                 # aot
                 BUILD_FLAGS="$AOT_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
                 if [[ ${ENABLE_QEMU} == 0 ]]; then
-                    build_iwasm_with_cfg $BUILD_FLAGS
+                    # build/aot, i.e. the aot running mode's own dir (run_coverage.py
+                    # looks for the mode's name, see spec_build_dirs())
+                    build_iwasm_with_cfg aot $BUILD_FLAGS
                 fi
                 if [ -z "${WAMRC_CMD}" ]; then
                    build_wamrc
                    WAMRC_CMD=${WAMRC_CMD_DEFAULT}
                 fi
+                COVERAGE_SPEC_DIRS+=("${WAMR_DIR}/wamr-compiler/build")
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" aot
                 done
-                collect_coverage llvm-aot
             ;;
 
             "fast-jit")
                 echo "work in fast-jit mode"
                 # fast-jit
                 BUILD_FLAGS="$FAST_JIT_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
-                build_iwasm_with_cfg $BUILD_FLAGS
+                build_iwasm_with_cfg fast-jit $BUILD_FLAGS
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" fast-jit
                 done
-                collect_coverage fast-jit
             ;;
 
             "multi-tier-jit")
                 echo "work in multi-tier-jit mode"
                 # multi-tier-jit
                 BUILD_FLAGS="$MULTI_TIER_JIT_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
-                build_iwasm_with_cfg $BUILD_FLAGS
+                build_iwasm_with_cfg multi-tier-jit $BUILD_FLAGS
                 for suite in "${TEST_CASE_ARR[@]}"; do
                     $suite"_test" multi-tier-jit
                 done
-                collect_coverage multi-tier-jit
             ;;
 
             *)
@@ -1222,26 +1387,9 @@ function remove_empty_elements()
     echo "${new_arr[@]}"
 }
 
-if [[ $TEST_CASE_ARR ]];then
-    # Check if 'unit' is in TEST_CASE_ARR
-    if [[ " ${TEST_CASE_ARR[@]} " =~ " unit " ]]; then
-        # unit test cases are designed with specific compilation flags
-        # and run under specific modes.
-        # There is no need to loop through all running modes in this script.
-        unit_test || (echo "TEST FAILED"; exit 1)
-        collect_coverage unit
-
-        # remove 'unit' from TEST_CASE_ARR
-        TEST_CASE_ARR=("${TEST_CASE_ARR[@]/unit}")
-        # remove empty elements from TEST_CASE_ARR
-        TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
-    fi
-
-    # loop others through all running modes
-    trigger || (echo "TEST FAILED"; exit 1)
-else
+if [[ -z "$TEST_CASE_ARR" ]]; then
     # test all suite, ignore polybench and libsodium because of long time cost
-    TEST_CASE_ARR=("spec" "malformed" "standalone")
+    TEST_CASE_ARR=("unit" "spec" "malformed" "standalone")
     : '
     if [[ $COLLECT_CODE_COVERAGE == 1 ]];then
         # add polybench if collecting code coverage data
@@ -1250,9 +1398,59 @@ else
         TEST_CASE_ARR+=("libsodium")
     fi
     '
-    # loop through all running modes
-    trigger || (echo "TEST FAILED"; exit 1)
-    # Add more suites here
+fi
+
+# A collection failure is a failed run: -C was asked for reports and did not get
+# them.  It is checked next to each suite's test status, so "TEST SUCCESSFUL"
+# still means both the tests and the reports the run asked for happened.
+coverage_status=0
+
+# Unit tests use dedicated runtime mode configurations.
+if [[ " ${TEST_CASE_ARR[@]} " =~ " unit " ]]; then
+    unit_test
+    unit_test_status=$?
+    report_coverage unit "${UNIT_TEST_BUILD_DIRS[@]}" || coverage_status=$?
+    if [[ ${unit_test_status} -ne 0 || ${coverage_status} -ne 0 ]]; then
+        echo "TEST FAILED"
+        exit 1
+    fi
+
+    # remove 'unit' from TEST_CASE_ARR before running the other suites
+    TEST_CASE_ARR=("${TEST_CASE_ARR[@]/unit}")
+    TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
+fi
+
+# Regression tests use dedicated runtime mode configurations as well.
+if [[ " ${TEST_CASE_ARR[@]} " =~ " regression " ]]; then
+    regression_test
+    regression_test_status=$?
+    report_coverage regression \
+        "${WAMR_DIR}"/tests/regression/ba-issues/build/build-iwasm-* \
+        || coverage_status=$?
+    if [[ ${regression_test_status} -ne 0 || ${coverage_status} -ne 0 ]]; then
+        echo "TEST FAILED"
+        exit 1
+    fi
+
+    # remove 'regression' from TEST_CASE_ARR before running the other suites
+    TEST_CASE_ARR=("${TEST_CASE_ARR[@]/regression}")
+    TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
+fi
+
+# loop all remaining suites through all running modes
+trigger
+trigger_status=$?
+
+# One coverage report per suite, holding every running mode this invocation
+# tested (the data of all of them is still in place).  Written even when a suite
+# failed, so a partial run still leaves usable coverage behind; a failed
+# collection, on the other hand, fails the run below.
+report_coverage spec "${COVERAGE_SPEC_DIRS[@]}" || coverage_status=$?
+report_coverage standalone "${COVERAGE_ROOT}"/standalone/*/ || coverage_status=$?
+
+if [[ ${trigger_status} -ne 0 || ${coverage_status} -ne 0 ]]; then
+    echo "TEST FAILED"
+    exit 1
 fi
 
 echo -e "Test finish. Reports are under ${REPORT_DIR}"
