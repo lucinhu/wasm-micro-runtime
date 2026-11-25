@@ -1194,9 +1194,20 @@ create_memory_info(const AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     WASMModule *module = comp_ctx->comp_data->wasm_module;
     WASMFunction *func = module->functions[func_index];
     LLVMTypeRef bound_check_type;
+    /* Private wasm32 memory with explicit equal limits cannot grow or
+     * shrink, even across imported calls. Host heap insertion increases
+     * both limits equally; retain runtime bounds instead of baking in the
+     * module's original size. Imported/shared/memory64 memories stay on the
+     * existing reload path. */
+    bool fixed_local_memory =
+        module->import_memory_count == 0 && module->memory_count == 1
+        && module->memories[0].flags == MAX_PAGE_COUNT_FLAG
+        && module->memories[0].init_page_count > 0
+        && module->memories[0].init_page_count
+               == module->memories[0].max_page_count;
     bool mem_space_unchanged =
         (!func->has_op_memory_grow && !func->has_op_func_call)
-        || (!module->possible_memory_grow);
+        || (!module->possible_memory_grow) || fixed_local_memory;
 #if WASM_ENABLE_SHARED_MEMORY != 0
     bool is_shared_memory;
 #endif
