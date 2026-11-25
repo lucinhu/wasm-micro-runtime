@@ -39,7 +39,7 @@ get_lib_shared_heap_export_apis(NativeSymbol **p_shared_heap_apis);
 #endif
 
 uint32
-get_libc_wasi_export_apis(NativeSymbol **p_libc_wasi_apis);
+get_libc_wasi_export_apis(const NativeSymbol **p_libc_wasi_apis);
 
 uint32
 get_base_lib_export_apis(NativeSymbol **p_base_lib_apis);
@@ -181,10 +181,11 @@ native_symbol_cmp(const void *native_symbol1, const void *native_symbol2)
 }
 
 static void *
-lookup_symbol(NativeSymbol *native_symbols, uint32 n_native_symbols,
+lookup_symbol(const NativeSymbol *native_symbols, uint32 n_native_symbols,
               const char *symbol, const char **p_signature, void **p_attachment)
 {
-    NativeSymbol *native_symbol, key = { 0 };
+    NativeSymbol key = { 0 };
+    const NativeSymbol *native_symbol;
 
     key.symbol = symbol;
 
@@ -260,8 +261,9 @@ wasm_native_resolve_symbol(const char *module_name, const char *field_name,
 }
 
 static bool
-register_natives(const char *module_name, NativeSymbol *native_symbols,
-                 uint32 n_native_symbols, bool call_conv_raw)
+register_sorted_natives(const char *module_name,
+                        const NativeSymbol *native_symbols,
+                        uint32 n_native_symbols, bool call_conv_raw)
 {
     NativeSymbolsNode *node;
 
@@ -279,6 +281,17 @@ register_natives(const char *module_name, NativeSymbol *native_symbols,
     /* Add to list head */
     node->next = g_native_symbols_list;
     g_native_symbols_list = node;
+
+    return true;
+}
+
+static bool
+register_natives(const char *module_name, NativeSymbol *native_symbols,
+                 uint32 n_native_symbols, bool call_conv_raw)
+{
+    if (!register_sorted_natives(module_name, native_symbols, n_native_symbols,
+                                 call_conv_raw))
+        return false;
 
     qsort(native_symbols, n_native_symbols, sizeof(NativeSymbol),
           native_symbol_cmp);
@@ -484,7 +497,7 @@ wasm_native_init()
 #if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0          \
     || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0           \
     || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0             \
-    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0      \
+    || WASM_ENABLE_APP_FRAMEWORK != 0                                    \
     || WASM_ENABLE_LIB_PTHREAD != 0 || WASM_ENABLE_LIB_WASI_THREADS != 0 \
     || WASM_ENABLE_WASI_NN != 0 || WASM_ENABLE_WASI_EPHEMERAL_NN != 0    \
     || WASM_ENABLE_SHARED_HEAP != 0
@@ -506,16 +519,17 @@ wasm_native_init()
 #endif /* WASM_ENABLE_SPEC_TEST */
 
 #if WASM_ENABLE_LIBC_WASI != 0
+    const NativeSymbol *wasi_symbols;
+    uint32 wasi_symbol_count;
     g_wasi_context_key = wasm_native_create_context_key(wasi_context_dtor);
     if (g_wasi_context_key == NULL) {
         goto fail;
     }
-    n_native_symbols = get_libc_wasi_export_apis(&native_symbols);
-    if (!wasm_native_register_natives("wasi_unstable", native_symbols,
-                                      n_native_symbols))
-        goto fail;
-    if (!wasm_native_register_natives("wasi_snapshot_preview1", native_symbols,
-                                      n_native_symbols))
+    wasi_symbol_count = get_libc_wasi_export_apis(&wasi_symbols);
+    if (!register_sorted_natives("wasi_unstable", wasi_symbols,
+                                 wasi_symbol_count, false)
+        || !register_sorted_natives("wasi_snapshot_preview1", wasi_symbols,
+                                    wasi_symbol_count, false))
         goto fail;
 #endif
 
@@ -602,7 +616,7 @@ wasm_native_init()
 #if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0          \
     || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0           \
     || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0             \
-    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0      \
+    || WASM_ENABLE_APP_FRAMEWORK != 0                                    \
     || WASM_ENABLE_LIB_PTHREAD != 0 || WASM_ENABLE_LIB_WASI_THREADS != 0 \
     || WASM_ENABLE_WASI_NN != 0 || WASM_ENABLE_WASI_EPHEMERAL_NN != 0    \
     || WASM_ENABLE_SHARED_HEAP != 0
@@ -617,7 +631,7 @@ wasm_native_init()
 #if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0          \
     || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0           \
     || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0             \
-    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0      \
+    || WASM_ENABLE_APP_FRAMEWORK != 0                                    \
     || WASM_ENABLE_LIB_PTHREAD != 0 || WASM_ENABLE_LIB_WASI_THREADS != 0 \
     || WASM_ENABLE_WASI_NN != 0 || WASM_ENABLE_WASI_EPHEMERAL_NN != 0    \
     || WASM_ENABLE_SHARED_HEAP != 0

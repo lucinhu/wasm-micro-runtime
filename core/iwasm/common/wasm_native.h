@@ -17,7 +17,7 @@ extern "C" {
 typedef struct NativeSymbolsNode {
     struct NativeSymbolsNode *next;
     const char *module_name;
-    NativeSymbol *native_symbols;
+    const NativeSymbol *native_symbols;
     uint32 n_native_symbols;
     bool call_conv_raw;
 } NativeSymbolsNode, *NativeSymbolsList;
