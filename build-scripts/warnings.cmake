@@ -10,8 +10,12 @@ else ()
   # -Wundef catches a feature macro that is used with #if but never given a
   # default, which would silently evaluate to 0.  Every WASM_ENABLE_* /
   # BH_ENABLE_* macro is expected to have an explicit value, see CONTRIBUTING.md.
+  # ESP-IDF Kconfig headers intentionally leave disabled options undefined.
+  if (NOT WAMR_BUILD_PLATFORM STREQUAL "esp-idf")
+    add_compile_options(-Wundef)
+  endif()
   add_compile_options(
-    -Wall -Wextra -Wformat -Wformat-security -Wundef
+    -Wall -Wextra -Wformat -Wformat-security
      $<$<COMPILE_LANGUAGE:C>:-Wshadow>
   )
   # -pedantic causes warnings like "ISO C forbids initialization between function pointer and ‘void *’" which
