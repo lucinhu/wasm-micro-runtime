@@ -57,6 +57,7 @@ struct AOTObjectData {
     AOTTargetInfo target_info;
 
     void *text;
+    uint8 *linked_text;
     uint32 text_size;
 
     void *text_unlikely;
@@ -4182,6 +4183,88 @@ get_relocation_groups_count(AOTObjectData *obj_data, uint32 *p_count)
     return true;
 }
 
+/* RV32 AUIPC/JALR calls to a defined function in the same text section
+ * have a load-address-independent displacement. Bind the canonical LLVM
+ * pair without changing either instruction's registers or its length. */
+static bool
+bind_rv32_local_call(const AOTObjectData *obj, const AOTRelocation *rel)
+{
+    enum { riscv_call = 18, riscv_call_plt = 19 };
+    const char *name = rel->symbol_name;
+    char *end;
+    unsigned long index;
+    uint8 *pair;
+    uint32 upper, lower, displacement;
+    const AOTObjectFunc *func;
+
+    if ((rel->relocation_type != riscv_call
+         && rel->relocation_type != riscv_call_plt)
+        || rel->relocation_addend != 0 || obj->text_size < 8
+        || rel->relocation_offset > obj->text_size - 8
+        || (rel->relocation_offset & 1) || !name
+        || !str_starts_with(name, AOT_FUNC_PREFIX))
+        return false;
+
+    index = strtoul(name + strlen(AOT_FUNC_PREFIX), &end, 10);
+    if (end == name + strlen(AOT_FUNC_PREFIX) || *end || index >= obj->func_count)
+        return false;
+    func = &obj->funcs[index];
+    if (!func->func_name || strcmp(name, func->func_name)
+        || func->text_offset >= obj->text_size || (func->text_offset & 1))
+        return false;
+
+    pair = obj->linked_text + rel->relocation_offset;
+    memcpy(&upper, pair, sizeof(upper));
+    memcpy(&lower, pair + 4, sizeof(lower));
+    if (!is_little_endian()) {
+        exchange_uint32((uint8 *)&upper);
+        exchange_uint32((uint8 *)&lower);
+    }
+    if ((upper & 0xfffff07f) != 0x17 || (lower & 0xfff0707f) != 0x67
+        || !(upper & 0xf80) || ((upper >> 7) & 31) != ((lower >> 15) & 31))
+        return false;
+
+    displacement = (uint32)func->text_offset - (uint32)rel->relocation_offset;
+    upper |= (displacement + 0x800u) & 0xfffff000u;
+    lower |= displacement << 20;
+    if (!is_little_endian()) {
+        exchange_uint32((uint8 *)&upper);
+        exchange_uint32((uint8 *)&lower);
+    }
+    memcpy(pair, &upper, sizeof(upper));
+    memcpy(pair + 4, &lower, sizeof(lower));
+    return true;
+}
+
+static void
+bind_rv32_text_calls(AOTObjectData *obj, AOTRelocationGroup *group)
+{
+    uint32 i, remaining = 0;
+    if (obj->comp_ctx->is_indirect_mode
+        || LLVMBinaryGetType(obj->binary) != LLVMBinaryTypeELF32L
+        || obj->target_info.e_machine != 243 /* EM_RISCV */
+        || strcmp(group->section_name, ".rela.text") || !obj->text_size
+        || !group->relocation_count)
+        return;
+
+    /* The object may be backed by a read-only LLVM memory buffer. */
+    if (!obj->linked_text) {
+        if (!(obj->linked_text = wasm_runtime_malloc(obj->text_size)))
+            return;
+        memcpy(obj->linked_text, obj->text, obj->text_size);
+        obj->text = obj->linked_text;
+    }
+    for (i = 0; i < group->relocation_count; i++) {
+        AOTRelocation *rel = &group->relocations[i];
+        if (!rel->is_symbol_name_allocated && bind_rv32_local_call(obj, rel))
+            continue;
+        if (remaining != i)
+            group->relocations[remaining] = *rel;
+        remaining++;
+    }
+    group->relocation_count = remaining;
+}
+
 static bool
 aot_resolve_object_relocation_groups(AOTObjectData *obj_data)
 {
@@ -4238,6 +4321,19 @@ aot_resolve_object_relocation_groups(AOTObjectData *obj_data)
                                                      sec_itr)) {
                 LLVMDisposeSectionIterator(sec_itr);
                 return false;
+            }
+
+            if (relocation_group->relocation_count) {
+                bind_rv32_text_calls(obj_data, relocation_group);
+                if (!relocation_group->relocation_count) {
+                    /* All calls were bound. This plain .rela.text group has
+                     * no owned section or symbol names. */
+                    wasm_runtime_free(relocation_group->relocations);
+                    memset(relocation_group, 0, sizeof(*relocation_group));
+                    obj_data->relocation_group_count--;
+                    LLVMMoveToNextSection(sec_itr);
+                    continue;
+                }
             }
 
             if (obj_data->comp_ctx->enable_llvm_pgo
@@ -4333,6 +4429,8 @@ aot_obj_data_destroy(AOTObjectData *obj_data)
         LLVMDisposeBinary(obj_data->binary);
     if (obj_data->mem_buf)
         LLVMDisposeMemoryBuffer(obj_data->mem_buf);
+    if (obj_data->linked_text)
+        wasm_runtime_free(obj_data->linked_text);
     if (obj_data->funcs)
         wasm_runtime_free(obj_data->funcs);
     if (obj_data->data_sections) {

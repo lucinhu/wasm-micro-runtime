@@ -3188,12 +3188,12 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
     uint8 *aot_text = is_literal ? module->literal : module->code;
     uint32 aot_text_size =
         is_literal ? module->literal_size : module->code_size;
-    uint32 i, func_index, symbol_len;
+    uint32 i, func_index;
 #if defined(BH_PLATFORM_WINDOWS)
     uint32 ymm_plt_index = 0, xmm_plt_index = 0;
     uint32 real_plt_index = 0, float_plt_index = 0, j;
 #endif
-    char symbol_buf[128] = { 0 }, *symbol, *p;
+    const char *symbol, *p;
     void *symbol_addr;
     AOTRelocation *relocation = group->relocations;
 
@@ -3205,17 +3205,9 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
 
     for (i = 0; i < group->relocation_count; i++, relocation++) {
         int32 symbol_index = -1;
-        symbol_len = (uint32)strlen(relocation->symbol_name);
-        if (symbol_len + 1 <= sizeof(symbol_buf))
-            symbol = symbol_buf;
-        else {
-            if (!(symbol = loader_malloc(symbol_len + 1, error_buf,
-                                         error_buf_size))) {
-                return false;
-            }
-        }
-        bh_memcpy_s(symbol, symbol_len, relocation->symbol_name, symbol_len);
-        symbol[symbol_len] = '\0';
+        /* load_relocation_section already obtained a stable NUL-terminated
+         * string for this symbol. It is only read during relocation. */
+        symbol = relocation->symbol_name;
 
 #if WASM_ENABLE_STATIC_PGO != 0
         if (!strcmp(symbol, "__llvm_profile_runtime")
@@ -3231,7 +3223,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                 || (func_index = (uint32)atoi(p)) >= module->func_count) {
                 set_error_buf_v(error_buf, error_buf_size,
                                 "invalid import symbol %s", symbol);
-                goto check_symbol_fail;
+                return false;
             }
 #if (defined(BUILD_TARGET_X86_64) || defined(BUILD_TARGET_AMD_64)) \
     && !defined(BH_PLATFORM_WINDOWS)
@@ -3265,7 +3257,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                 || (func_index = (uint32)atoi(p)) >= module->func_count) {
                 set_error_buf_v(error_buf, error_buf_size, "invalid symbol %s",
                                 symbol);
-                goto check_symbol_fail;
+                return false;
             }
             symbol_addr = module->func_ptrs[func_index];
         }
@@ -3276,7 +3268,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                 || (func_index = (uint32)atoi(p)) >= module->func_count) {
                 set_error_buf_v(error_buf, error_buf_size, "invalid symbol %s",
                                 symbol);
-                goto check_symbol_fail;
+                return false;
             }
             symbol_addr = module->func_ptrs[func_index];
         }
@@ -3304,7 +3296,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
             if (!symbol_addr) {
                 set_error_buf_v(error_buf, error_buf_size,
                                 "invalid data section (%s)", symbol);
-                goto check_symbol_fail;
+                return false;
             }
         }
         else if (!strcmp(symbol, ".literal")) {
@@ -3329,7 +3321,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                                 (uint64 *)((uint8 *)symbol_addr + 8 * j))) {
                     set_error_buf_v(error_buf, error_buf_size,
                                     "resolve symbol %s failed", symbol);
-                    goto check_symbol_fail;
+                    return false;
                 }
             }
             ymm_plt_index++;
@@ -3348,7 +3340,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                                 (uint64 *)((uint8 *)symbol_addr + 8 * j))) {
                     set_error_buf_v(error_buf, error_buf_size,
                                     "resolve symbol %s failed", symbol);
-                    goto check_symbol_fail;
+                    return false;
                 }
             }
             xmm_plt_index++;
@@ -3365,7 +3357,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
             if (!str2uint64(real_buf, (uint64 *)symbol_addr)) {
                 set_error_buf_v(error_buf, error_buf_size,
                                 "resolve symbol %s failed", symbol);
-                goto check_symbol_fail;
+                return false;
             }
             real_plt_index++;
         }
@@ -3382,7 +3374,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
             if (!str2uint32(float_buf, (uint32 *)symbol_addr)) {
                 set_error_buf_v(error_buf, error_buf_size,
                                 "resolve symbol %s failed", symbol);
-                goto check_symbol_fail;
+                return false;
             }
             float_plt_index++;
         }
@@ -3390,11 +3382,8 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
         else if (!(symbol_addr = resolve_target_sym(symbol, &symbol_index))) {
             set_error_buf_v(error_buf, error_buf_size,
                             "resolve symbol %s failed", symbol);
-            goto check_symbol_fail;
+            return false;
         }
-
-        if (symbol != symbol_buf)
-            wasm_runtime_free(symbol);
 
         if (!apply_relocation(
                 module, aot_text, aot_text_size, relocation->relocation_offset,
@@ -3404,11 +3393,6 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
     }
 
     return true;
-
-check_symbol_fail:
-    if (symbol != symbol_buf)
-        wasm_runtime_free(symbol);
-    return false;
 }
 
 static bool
