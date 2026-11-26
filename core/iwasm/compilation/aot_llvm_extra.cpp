@@ -235,6 +235,33 @@ match_esp_scaled_sub(Instruction &I, FunctionType *Ty, InlineAsm *Sub2,
     return Call;
 }
 
+/* A reserved Wasm export opts a leaf kernel into Zbb. The guest keeps a
+ * baseline implementation and selects the kernel only on a capable host.
+ * Set attributes before LTO so inlining respects the ISA boundary. */
+static void
+mark_rv32_zbb_variants(Module &M, const TargetMachine &TM, WASMModule *wasm)
+{
+    if (TM.getTargetTriple().getArch() != Triple::riscv32 || !wasm)
+        return;
+    for (uint32 i = 0; i < wasm->export_count; ++i) {
+        const auto &exp = wasm->exports[i];
+        if (exp.kind != EXPORT_KIND_FUNC
+            || exp.index < wasm->import_function_count
+            || !StringRef(exp.name).starts_with("__wamr_rv32_zbb_"))
+            continue;
+        const auto index =
+            std::to_string(exp.index - wasm->import_function_count);
+        Function *F = M.getFunction(AOT_FUNC_INTERNAL_PREFIX + index);
+        if (!F)
+            F = M.getFunction(AOT_FUNC_PREFIX + index);
+        if (F) {
+            F->addFnAttr("target-features",
+                         (TM.getTargetFeatureString() + ",+zbb").str());
+            F->addFnAttr(Attribute::NoInline);
+        }
+    }
+}
+
 static void
 lower_rv32_arithmetic(Module &M, const TargetMachine &TM)
 {
@@ -247,20 +274,22 @@ lower_rv32_arithmetic(Module &M, const TargetMachine &TM)
         });
     };
     bool HasPie = Enabled("xesppie"), HasZbb = Enabled("zbb");
-    if (!HasPie && !HasZbb)
-        return;
 
     Type *I32 = Type::getInt32Ty(M.getContext());
     FunctionType *Ty = FunctionType::get(I32, { I32, I32 }, false);
     auto *Sub2 = InlineAsm::get(Ty, "esp.subx2 $0, $1, $2", "=r,r,r", false);
     auto *Sub4 = InlineAsm::get(Ty, "esp.subx4 $0, $1, $2", "=r,r,r", false);
     for (Function &F : M) {
+        bool use_zbb = HasZbb || (F.hasFnAttribute("target-features")
+            && F.getFnAttribute("target-features").getValueAsString().ends_with(",+zbb"));
+        if (!HasPie && !use_zbb)
+            continue;
         for (BasicBlock &BB : F) {
             for (Instruction &I : llvm::make_early_inc_range(BB)) {
                 if (I.getType() != I32)
                     continue;
                 CallInst *Call = nullptr;
-                if (HasZbb && I.getOpcode() == Instruction::Xor) {
+                if (use_zbb && I.getOpcode() == Instruction::Xor) {
                     if (Value *X = match_wasm_bswap(I)) {
                         auto *BSwap = Intrinsic::getDeclaration(
                             &M, Intrinsic::bswap, I32);
@@ -407,6 +436,10 @@ aot_apply_llvm_new_pass_manager(AOTCompContext *comp_ctx, LLVMModuleRef module)
 #endif
 
     Module *M = reinterpret_cast<Module *>(module);
+#if LLVM_VERSION_MAJOR >= 18 && defined(WAMR_HAVE_RISCV_ASM_PARSER)
+    if (!comp_ctx->is_jit_mode)
+        mark_rv32_zbb_variants(*M, *TM, comp_ctx->comp_data->wasm_module);
+#endif
     if (disable_llvm_lto) {
         for (Function &F : *M) {
             F.addFnAttr("disable-tail-calls", "true");

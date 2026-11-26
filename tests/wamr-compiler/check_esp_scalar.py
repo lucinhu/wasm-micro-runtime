@@ -45,6 +45,12 @@ def main():
             listing = instructions(args, work, wasm, flags)
             actual = tuple(listing.count(op) for op in ops)
             assert actual == expected, (flags, actual, expected)
+        compile_source(args.clang, """
+            unsigned baseline(unsigned x) { return __builtin_popcount(x); }
+            __attribute__((export_name("__wamr_rv32_zbb_count"), noinline))
+            unsigned variant(unsigned x) { return __builtin_popcount(x); }
+        """, wasm)
+        assert instructions(args, work, wasm, '').count('cpop') == 1
         # A second input in the rotate/XOR expansion is not a byte swap.
         compile_source(args.clang, """
             unsigned mixed(unsigned x, unsigned y) {
