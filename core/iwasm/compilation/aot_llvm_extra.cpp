@@ -30,6 +30,8 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Support/CommandLine.h>
@@ -187,6 +189,98 @@ aot_check_simd_compatibility(LLVMTargetMachineRef target_machine)
     return true;
 #endif /* WASM_ENABLE_SIMD */
 }
+
+#if LLVM_VERSION_MAJOR >= 18 && defined(WAMR_HAVE_RISCV_ASM_PARSER)
+/* Wasm has no bswap opcode. LLVM's Wasm backend expands bswap32 into
+ * rotl(x,24) ^ (((rotl(x,16) ^ x) >> 8) & 0x00ff00ff). Recover it
+ * only when every operand is the same SSA value and every constant matches. */
+static Value *
+match_wasm_bswap(Instruction &I)
+{
+    using namespace llvm::PatternMatch;
+    Value *X;
+    auto Rot24 = m_FShl(m_Value(X), m_Deferred(X), m_SpecificInt(24));
+    auto Rot16 = m_FShl(m_Deferred(X), m_Deferred(X), m_SpecificInt(16));
+    auto Masked =
+        m_c_And(m_LShr(m_c_Xor(Rot16, m_Deferred(X)), m_SpecificInt(8)),
+                m_SpecificInt(0x00ff00ff));
+    return match(&I, m_c_Xor(Rot24, Masked)) ? X : nullptr;
+}
+
+static CallInst *
+match_esp_scaled_sub(Instruction &I, FunctionType *Ty, InlineAsm *Sub2,
+                     InlineAsm *Sub4)
+{
+    using namespace llvm::PatternMatch;
+    Value *Base, *Index;
+    ConstantInt *Scale;
+    InlineAsm *Op;
+    if (match(&I, m_Sub(m_Value(Base),
+                        m_OneUse(m_Shl(m_Value(Index), m_ConstantInt(Scale)))))
+        && (Scale->equalsInt(1) || Scale->equalsInt(2)))
+        Op = Scale->equalsInt(1) ? Sub2 : Sub4;
+    else if (match(&I, m_c_Add(m_Value(Base),
+                               m_OneUse(m_Mul(m_Value(Index),
+                                              m_ConstantInt(Scale)))))
+             && (Scale->getSExtValue() == -2 || Scale->getSExtValue() == -4))
+        Op = Scale->getSExtValue() == -2 ? Sub2 : Sub4;
+    else
+        return nullptr;
+
+    /* These PIE arithmetic instructions only read and write ordinary GPRs. */
+    auto *Call = CallInst::Create(Ty, Op, { Base, Index }, "", &I);
+    Call->setDoesNotAccessMemory();
+    Call->setDoesNotThrow();
+    Call->addFnAttr(Attribute::WillReturn);
+    return Call;
+}
+
+static void
+lower_rv32_arithmetic(Module &M, const TargetMachine &TM)
+{
+    if (TM.getTargetTriple().getArch() != Triple::riscv32)
+        return;
+    const MCSubtargetInfo *STI = TM.getMCSubtargetInfo();
+    auto Enabled = [&](StringRef Name) {
+        return llvm::any_of(STI->getAllProcessorFeatures(), [&](const auto &F) {
+            return Name == F.Key && STI->getFeatureBits()[F.Value];
+        });
+    };
+    bool HasPie = Enabled("xesppie"), HasZbb = Enabled("zbb");
+    if (!HasPie && !HasZbb)
+        return;
+
+    Type *I32 = Type::getInt32Ty(M.getContext());
+    FunctionType *Ty = FunctionType::get(I32, { I32, I32 }, false);
+    auto *Sub2 = InlineAsm::get(Ty, "esp.subx2 $0, $1, $2", "=r,r,r", false);
+    auto *Sub4 = InlineAsm::get(Ty, "esp.subx4 $0, $1, $2", "=r,r,r", false);
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : llvm::make_early_inc_range(BB)) {
+                if (I.getType() != I32)
+                    continue;
+                CallInst *Call = nullptr;
+                if (HasZbb && I.getOpcode() == Instruction::Xor) {
+                    if (Value *X = match_wasm_bswap(I)) {
+                        auto *BSwap = Intrinsic::getDeclaration(
+                            &M, Intrinsic::bswap, I32);
+                        Call = CallInst::Create(BSwap, { X }, "", &I);
+                    }
+                }
+                else if (HasPie
+                         && (I.getOpcode() == Instruction::Sub
+                             || I.getOpcode() == Instruction::Add))
+                    Call = match_esp_scaled_sub(I, Ty, Sub2, Sub4);
+                if (Call) {
+                    Call->setDebugLoc(I.getDebugLoc());
+                    I.replaceAllUsesWith(Call);
+                    I.eraseFromParent();
+                }
+            }
+        }
+    }
+}
+#endif
 
 void
 aot_apply_llvm_new_pass_manager(AOTCompContext *comp_ctx, LLVMModuleRef module)
@@ -402,6 +496,10 @@ aot_apply_llvm_new_pass_manager(AOTCompContext *comp_ctx, LLVMModuleRef module)
     }
 
     MPM.run(*M, MAM);
+#if LLVM_VERSION_MAJOR >= 18 && defined(WAMR_HAVE_RISCV_ASM_PARSER)
+    if (!comp_ctx->is_jit_mode && comp_ctx->opt_level > 0)
+        lower_rv32_arithmetic(*M, *TM);
+#endif
 }
 
 char *

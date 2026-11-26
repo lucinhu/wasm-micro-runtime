@@ -181,6 +181,11 @@ endif()
 # tests (see llvm_env.cmake).
 include (${PROJECT_SOURCE_DIR}/../build-scripts/llvm_env.cmake)
 
+# The pinned Espressif LLVM 18 backend uses the xesppie target feature.
+if (LLVM_VERSION_MAJOR EQUAL 18 AND TARGET LLVMRISCVAsmParser)
+  add_definitions(-DWAMR_HAVE_RISCV_ASM_PARSER=1)
+endif ()
+
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 

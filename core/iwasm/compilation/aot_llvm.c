@@ -2620,6 +2620,9 @@ aot_compiler_init(void)
     LLVMInitializeAllTargets();
     LLVMInitializeAllTargetMCs();
     LLVMInitializeAllAsmPrinters();
+#ifdef WAMR_HAVE_RISCV_ASM_PARSER
+    LLVMInitializeRISCVAsmParser();
+#endif
 #else
     /* Init environment of native for JIT compiler */
     LLVMInitializeNativeTarget();
